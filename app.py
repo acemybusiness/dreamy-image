@@ -1,8 +1,11 @@
 import io
+import os
 import re
 import sqlite3
 import uuid
 import zipfile
+
+import requests
 from pathlib import Path
 
 import imagehash
@@ -12,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 APP_NAME = "Dreamy Image Asset Factory"
 DB_FILE = "dreamy_image.db"
+STABILITY_API_URL = "https://api.stability.ai/v2beta/stable-image/generate/ultra"
 STORAGE_ROOT = Path("storage/packs")
 STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -89,7 +93,38 @@ def sanitize_prompt(user_text: str):
 def prompt_seed(text: str) -> int:
     return abs(hash(text)) % (2**32)
 
+def get_stability_key():
+    try:
+        return st.secrets.get("STABILITY_API_KEY", os.getenv("STABILITY_API_KEY", ""))
+    except Exception:
+        return os.getenv("STABILITY_API_KEY", "")
+
+def generate_live_image(final_prompt: str, ratio: str) -> Image.Image:
+    """Generate a real AI image when STABILITY_API_KEY is configured."""
+    api_key = get_stability_key().strip()
+    if not api_key:
+        raise RuntimeError("STABILITY_API_KEY is not configured yet.")
+
+    aspect_ratio = "9:16" if ratio == "9:16 Portrait" else "1:1"
+    response = requests.post(
+        STABILITY_API_URL,
+        headers={
+            "authorization": f"Bearer {api_key}",
+            "accept": "image/*",
+        },
+        files={
+            "prompt": (None, final_prompt),
+            "aspect_ratio": (None, aspect_ratio),
+            "output_format": (None, "png"),
+        },
+        timeout=180,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Image API error {response.status_code}: {response.text[:500]}")
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
 def generate_local_preview(final_prompt: str, ratio: str) -> Image.Image:
+    """Offline fallback so the interface can still be tested without an API key."""
     w, h = (576, 1024) if ratio == "9:16 Portrait" else (768, 768)
     rng = np.random.default_rng(prompt_seed(final_prompt))
     y = np.linspace(0, 1, h)[:, None]
@@ -276,12 +311,23 @@ if mode == "🏭 Creator Studio":
         price = st.number_input("Price ($)", min_value=0.99, value=4.99, step=0.50)
         prompt = st.text_area("Scene description", "A stone lookout tower beside cascading rivers and glowing trees", height=140)
         ratio = st.radio("Aspect ratio", ["9:16 Portrait", "1:1 Square"])
-        generate = st.button("Generate Draft Pack", type="primary", use_container_width=True)
+        live_ready = bool(get_stability_key().strip())
+        st.caption("Image engine: " + ("LIVE AI" if live_ready else "Demo fallback — add STABILITY_API_KEY to go live"))
+        generate = st.button("Generate Image & Build Layers", type="primary", use_container_width=True)
 
     if generate:
         safe_prompt, replacements = sanitize_prompt(prompt)
-        master = generate_local_preview(safe_prompt, ratio)
-        assets = segment_layers(master)
+        try:
+            if get_stability_key().strip():
+                with st.spinner("Generating your fantasy image..."):
+                    master = generate_live_image(safe_prompt, ratio)
+            else:
+                st.warning("No live image API key is configured, so this run uses the demo preview generator.")
+                master = generate_local_preview(safe_prompt, ratio)
+            assets = segment_layers(master)
+        except Exception as exc:
+            st.error(f"Image generation failed: {exc}")
+            st.stop()
         pack_id = create_pack(title, prompt, safe_prompt, float(price), master, assets)
         st.session_state.update(latest_pack_id=pack_id, latest_master=master, latest_assets=assets, latest_replacements=replacements)
 
